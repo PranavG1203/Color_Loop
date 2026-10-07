@@ -8,6 +8,7 @@ import streamlit.components.v1 as components
 
 from colors import color_by_name, color_of_day
 from geo import location_button
+import llm
 from llm import backend
 from palette import palette_colors, palette_png
 from route import TARGET_KM, Loop, build_loop, parse_or_geocode, to_gpx
@@ -40,8 +41,10 @@ def quest_for(color: str, minutes: int, km: float, model: str) -> tuple[str, str
 
 
 @st.cache_data(show_spinner=False, max_entries=20)
-def judge(photos: tuple[tuple[str, bytes], ...], color: str, route: tuple | None, model: str) -> list[PhotoResult]:
-    return judge_walk(photos, color_by_name(color), route, observe if AI.kind != "none" else None, workers())
+def judge(photos: tuple[tuple[str, bytes], ...], color: str, route: tuple | None, model: str) -> tuple[list[PhotoResult], str | None]:
+    llm.last_error = None
+    results = judge_walk(photos, color_by_name(color), route, observe if AI.kind != "none" else None, workers())
+    return results, llm.last_error
 
 
 @st.cache_data(show_spinner=False, max_entries=20)
@@ -212,8 +215,12 @@ if uploads:
     photos = tuple((f.name, f.getvalue()) for f in uploads[:MAX_PHOTOS])
     route = tuple(loop.points) if loop and loop.routed else None
     with st.spinner("Measuring pixels, then asking Gemma what it sees. On a laptop CPU this takes about 40 s per photo…" if AI.kind == "ollama" else "Measuring pixels, then asking Gemma what it sees…"):
-        results = judge(photos, target.name, route, AI.label)
+        results, ai_error = judge(photos, target.name, route, AI.label)
     summary = summarize(results, minutes)
+    color_passed = any(r.accepted or r.ai_checked for r in results) or any(r.score >= MIN_FRACTION for r in results)
+    if AI.kind != "none" and color_passed and summary.ai_checked == 0:
+        reason = ai_error or "the model replied, but not in the expected JSON format"
+        html(f'<div class="notice"><span class="lbl"><b>Gemma did not check these photos</b></span><span class="quiet">{safe(AI.label)} · {safe(reason)}</span></div>')
 
     spacer(24)
     rows = "".join(
@@ -263,4 +270,4 @@ else:
     html('<div class="quiet" style="margin-top:4px">Photos are analysed in memory for this session and are not stored.</div>')
 
 spacer(96)
-html('<div class="rule soft"><span class="lbl">Color Loop / open source / Gemma 3 · OpenStreetMap · OSRM · OpenCV · Ollama</span><span class="lbl">Touch grass</span></div>')
+html('<div class="rule soft"><span class="lbl">Color Loop / open source / Gemma · OpenStreetMap · OSRM · OpenCV · Ollama</span><span class="lbl">Touch grass</span></div>')

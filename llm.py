@@ -21,7 +21,8 @@ from PIL import Image
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma3:4b")
 STUDIO_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-STUDIO_MODEL = os.environ.get("GEMMA_MODEL", "gemma-3-27b-it")
+STUDIO_MODEL = "gemma-4-26b-a4b-it"  # open-weight Gemma 4 MoE; override with GEMMA_MODEL
+THINKING_ROOM = 1024  # Gemma 4 reasons before answering; those tokens count against the output limit
 IMAGE_SIDE = 640
 
 
@@ -39,17 +40,28 @@ class Backend:
         return "no model connected"
 
 
-def _studio_key() -> str | None:
-    """Key from the environment, or from Streamlit secrets (Community Cloud / .streamlit/secrets.toml)."""
-    key = os.environ.get("GEMMA_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if key:
-        return key
+def _setting(*names: str) -> str | None:
+    """Environment first, then Streamlit secrets (Community Cloud / .streamlit/secrets.toml)."""
+    for name in names:
+        if os.environ.get(name):
+            return os.environ[name]
     try:
         import streamlit as st
 
-        return st.secrets.get("GEMMA_API_KEY") or st.secrets.get("GOOGLE_API_KEY")
+        for name in names:
+            if st.secrets.get(name):
+                return str(st.secrets[name])
     except Exception:  # no secrets file, or not running inside Streamlit
-        return None
+        pass
+    return None
+
+
+def _studio_key() -> str | None:
+    return _setting("GEMMA_API_KEY", "GOOGLE_API_KEY")
+
+
+# Last failure from the model, shown in the UI so a bad key or quota is visible instead of silent.
+last_error: str | None = None
 
 
 _cached: tuple[float, Backend] | None = None
@@ -65,6 +77,11 @@ def backend() -> Backend:
 
 
 def _find_backend() -> Backend:
+    """GEMMA_BACKEND = auto (default) | ollama | studio. 'studio' lets you test the hosted path locally."""
+    choice = (_setting("GEMMA_BACKEND") or "auto").lower()
+    model = _setting("GEMMA_MODEL") or STUDIO_MODEL
+    if choice == "studio":
+        return Backend("studio", model) if _studio_key() else Backend("none", "")
     try:
         with urlopen(f"{OLLAMA_HOST}/api/tags", timeout=0.8) as response:
             models = [m["name"] for m in json.loads(response.read()).get("models", [])]
@@ -72,8 +89,8 @@ def _find_backend() -> Backend:
             return Backend("ollama", OLLAMA_MODEL)
     except (OSError, ValueError, KeyError):
         pass
-    if _studio_key():
-        return Backend("studio", STUDIO_MODEL)
+    if choice != "ollama" and _studio_key():
+        return Backend("studio", model)
     return Backend("none", "")
 
 
@@ -86,8 +103,8 @@ def _jpeg_b64(image_bytes: bytes) -> str:
     return base64.b64encode(out.getvalue()).decode()
 
 
-def _post(url: str, body: dict, timeout: float) -> dict:
-    request = Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+def _post(url: str, body: dict, timeout: float, headers: dict | None = None) -> dict:
+    request = Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json", **(headers or {})})
     with urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
@@ -98,7 +115,8 @@ def parallel_calls() -> int:
 
 
 def generate(prompt: str, image: bytes | None = None, json_mode: bool = False, max_tokens: int = 300) -> str | None:
-    """Run the prompt (optionally with one photo) on Gemma. None means no answer."""
+    """Run the prompt (optionally with one photo) on Gemma. None means no answer; see last_error."""
+    global last_error
     chosen = backend()
     try:
         if chosen.kind == "ollama":
@@ -114,14 +132,29 @@ def generate(prompt: str, image: bytes | None = None, json_mode: bool = False, m
             parts: list[dict] = [{"text": prompt}]
             if image:
                 parts.append({"inline_data": {"mime_type": "image/jpeg", "data": _jpeg_b64(image)}})
-            config = {"temperature": 0.3, "maxOutputTokens": max_tokens}
+            # Short, factual tasks: minimal thinking is ~10x faster and stops long reasoning eating the token limit.
+            config = {"temperature": 0.3, "maxOutputTokens": max_tokens + THINKING_ROOM, "thinkingConfig": {"thinkingLevel": "minimal"}}
             body = {"contents": [{"role": "user", "parts": parts}], "generationConfig": config}
-            data = _post(f"{STUDIO_URL}/{chosen.model}:generateContent?key={_studio_key()}", body, 60)
-            text = "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"])
-            return text.strip() or None
-    except HTTPError:
+            # Key goes in a header, never the URL, so it cannot leak into logs or error messages.
+            data = _post(f"{STUDIO_URL}/{chosen.model}:generateContent", body, 60, {"x-goog-api-key": _studio_key() or ""})
+            candidate = (data.get("candidates") or [{}])[0]
+            # Skip the model's reasoning parts ("thought": true) and keep only the answer.
+            parts = candidate.get("content", {}).get("parts", [])
+            text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+            if not text.strip():
+                last_error = f"empty reply (finish reason: {candidate.get('finishReason', 'unknown')})"
+                return None
+            last_error = None
+            return text.strip()
+    except HTTPError as error:
+        try:
+            detail = json.loads(error.read().decode("utf-8")).get("error", {}).get("message", "")
+        except (OSError, ValueError, AttributeError):
+            detail = ""
+        last_error = f"HTTP {error.code}: {detail[:200] or error.reason}"
         return None
-    except (OSError, ValueError, KeyError, IndexError):
+    except (OSError, ValueError, KeyError, IndexError) as error:
+        last_error = f"{type(error).__name__}: {str(error)[:200]}"
         return None
     return None
 
