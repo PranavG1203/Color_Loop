@@ -67,3 +67,7 @@ Ollama can't run on Community Cloud, so the hosted app calls open Gemma 4 throug
 pip install pytest
 python -m pytest -q
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
