@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
-from math import asin, cos, radians, sin, sqrt
+from math import asin, cos, isfinite, radians, sin, sqrt
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Sequence
 
@@ -82,11 +82,16 @@ def read_exif(image: Image.Image) -> tuple[datetime | None, LatLon | None]:
             lon = sum(_rational(part) / 60**i for i, part in enumerate(gps[4]))
             lat = -lat if gps.get(1) == "S" else lat
             lon = -lon if gps.get(3) == "W" else lon
-            if (lat, lon) != (0.0, 0.0):
+            # Phones write 0/0 when they had no fix; newer Pillow turns that into nan, not an error.
+            if _valid_location(lat, lon):
                 location = (lat, lon)
         except (TypeError, ValueError, ZeroDivisionError):
             location = None
     return taken_at, location
+
+
+def _valid_location(lat: float, lon: float) -> bool:
+    return isfinite(lat) and isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180 and (lat, lon) != (0.0, 0.0)
 
 
 def inspect_image(image: Image.Image, target: ColorTarget) -> tuple[float, tuple[int, int, int]]:
@@ -192,7 +197,7 @@ def judge_walk(
         reason = None
         if route and result.location:
             off_route = distance_to_path(result.location, route)
-            if off_route > ROUTE_METERS:
+            if isfinite(off_route) and off_route > ROUTE_METERS:
                 reason = f"{off_route:.0f} m off the planned loop"
         if reason is None and result.taken_at:
             for previous in counted:

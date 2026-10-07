@@ -171,3 +171,18 @@ def test_parse_json_handles_code_fences():
 
     assert parse_json('```json\n{"outdoors": true, "subject": "red door"}\n```') == {"outdoors": True, "subject": "red door"}
     assert parse_json("no json here") is None
+
+
+def test_broken_gps_never_reports_infinite_distance(monkeypatch):
+    """Phones write 0/0 GPS when they had no fix; newer Pillow reads that as nan."""
+    import verify
+
+    nan = float("nan")
+    assert not verify._valid_location(nan, nan)
+    assert not verify._valid_location(0.0, 0.0)
+    assert not verify._valid_location(123.0, 13.4)
+    assert verify._valid_location(18.52, 73.85)
+
+    monkeypatch.setattr(verify, "read_exif", lambda image: (None, (nan, nan)))
+    result = judge_walk([("a.jpg", photo((210, 40, 40)))], RED, route=[(52.52, 13.40), (52.52, 13.41)])[0]
+    assert result.accepted and "inf" not in result.reason
