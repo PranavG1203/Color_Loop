@@ -1,0 +1,5 @@
+streamlit>=1.52,<2
+folium>=0.17,<1
+opencv-python-headless>=4.10,<5
+numpy>=2.0,<3
+Pillow>=10.4,<13
